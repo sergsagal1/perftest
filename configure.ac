@@ -24,6 +24,8 @@ AC_SUBST(MINOR_VERSION)
 AC_ARG_VAR(CUDA_H_PATH, help-string)
 AC_ARG_VAR(RANLIB, ranlib tool)
 
+AC_ARG_VAR(HSA_INC_PATH, Location of HSA header files to enable ROCm support)
+
 AC_ARG_ENABLE([verbs_exp],
 [AS_HELP_STRING([--disable-verbs_exp],
 [Disable Verbs Experimental])],
@@ -169,6 +171,22 @@ if [test "$CUDA_H_PATH" ]; then
 	AC_DEFINE([HAVE_CUDA], [1], [Enable CUDA feature])
 	AC_DEFINE_UNQUOTED([CUDA_PATH], "$CUDA_H_PATH" , [Enable CUDA feature])
 	LIBS=$LIBS" -lcuda"
+fi
+
+if [test "$HSA_INC_PATH" ]; then
+        AC_MSG_NOTICE([Enable ROCm Support])
+        AC_CHECK_SIZEOF([void*])
+        if test "x$ac_cv_sizeof_voidp" == "x"; then
+                AC_ERROR([Cannot determine size of void*])
+        fi
+        if test "${ac_cv_sizeof_voidp}" = "4"; then
+                AC_ERROR([You are trying to enable HSA support on a 32-bit platform])
+        fi
+        AC_DEFINE([HAVE_ROCM], [1], [Enable ROCm platform support])
+        AC_DEFINE_UNQUOTED([HSA_PATH], "$HSA_INC_PATH/hsa.h" , [Enable HSA feature])
+        AC_DEFINE_UNQUOTED([HSA_EXT_AMD_PATH], "$HSA_INC_PATH/hsa_ext_amd.h" , [Enable HSA AMD extension])
+
+	LIBS=$LIBS" -lhsa-runtime64"
 fi
 
 AC_TRY_LINK([

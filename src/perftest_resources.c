@@ -133,6 +133,204 @@ static int pp_free_gpu(struct pingpong_context *ctx)
 }
 #endif
 
+#ifdef HAVE_ROCM
+
+static hsa_agent_t  hsa_agent;
+static hsa_amd_memory_pool_t hsa_pool;
+static unsigned long hsa_iterate_index;
+
+static hsa_status_t hsa_agent_callback(hsa_agent_t agent, void* data)
+{
+	char name[64];
+	uint32_t bdfid;
+	hsa_device_type_t device_type;
+	hsa_status_t status;
+	struct perftest_parameters *user_param =
+		(struct perftest_parameters *)data;
+
+	if (hsa_iterate_index == user_param->hsa_agent_index) {
+		status = hsa_agent_get_info(agent, HSA_AGENT_INFO_NAME, name);
+
+		if (status != HSA_STATUS_SUCCESS) {
+			printf("Failure to get agent name : 0x%x\n", status);
+			exit(1);
+		}
+
+		status = hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &device_type);
+		if (status != HSA_STATUS_SUCCESS) {
+			printf("Failure to get device type: 0x%x\n", status);
+			exit(1);
+		}
+
+		if (device_type == HSA_DEVICE_TYPE_GPU) {
+			status = hsa_agent_get_info(agent, HSA_AMD_AGENT_INFO_BDFID, &bdfid);
+			if (status != HSA_STATUS_SUCCESS) {
+				printf("Failure to get PCI Info: 0x%x\n", status);
+				exit(1);
+			}
+
+			// BFD: eight-bit PCI bus, five-bit device, and three-bit
+			// function number
+			uint32_t Bus	= (bdfid >> 8) & 0xFF;
+			uint32_t Device	= (bdfid >> 3) & 0x1F;
+			uint32_t Func	= bdfid & 0x7;
+
+			printf("Found GPU agent : %s.\n", name);
+			printf("      Device topology 		PCI [ B#%02d, D#%02d, F#%02d ]\n",
+					Bus, Device, Func);
+		}
+		else {
+			printf("Found CPU agent : %s.\n", name);
+		}
+
+		hsa_agent = agent;
+		return HSA_STATUS_INFO_BREAK;
+	}
+
+	hsa_iterate_index++;
+	// Keep iterating
+	return HSA_STATUS_SUCCESS;
+}
+
+static hsa_status_t memory_pool_callback(hsa_amd_memory_pool_t memory_pool, void* data)
+{
+	hsa_status_t status;
+	hsa_amd_memory_pool_global_flag_t global_flags;
+	size_t	pool_size;
+	hsa_amd_segment_t amd_segment;
+
+	struct perftest_parameters *user_param =
+		(struct perftest_parameters *)data;
+
+	status = hsa_amd_memory_pool_get_info(memory_pool,
+					HSA_AMD_MEMORY_POOL_INFO_SEGMENT,
+					&amd_segment);
+
+	if (status != HSA_STATUS_SUCCESS) {
+		printf("Failure to get pool info: 0x%x\n", status);
+		exit(1);
+	}
+
+	if (amd_segment ==  HSA_AMD_SEGMENT_GLOBAL) {
+		if (hsa_iterate_index == user_param->hsa_pool_index) {
+
+		status = hsa_amd_memory_pool_get_info(memory_pool,
+						HSA_AMD_MEMORY_POOL_INFO_GLOBAL_FLAGS,
+						&global_flags);
+
+		if (status != HSA_STATUS_SUCCESS) {
+			printf("Failure to query global flags: 0x%x\n", status);
+			exit(1);
+		}
+
+		status = hsa_amd_memory_pool_get_info(memory_pool,
+						HSA_AMD_MEMORY_POOL_INFO_SIZE,
+						&pool_size);
+
+		if (status != HSA_STATUS_SUCCESS) {
+			printf("Failure to query pool size: 0x%x\n", status);
+			exit(1);
+		}
+
+		printf("Found global pool.\n"
+			"    Flags  : 0x%x\n"
+			"    Size   : 0x%lx (%ldMiB)\n",
+				global_flags, pool_size, pool_size / (1024L * 1024L));
+			hsa_pool = memory_pool;
+			return HSA_STATUS_INFO_BREAK;
+		}
+
+		hsa_iterate_index++;
+	}
+
+	return HSA_STATUS_SUCCESS;
+}
+
+static int pp_hsa_init(struct pingpong_context *ctx, size_t _size, struct perftest_parameters *user_param)
+{
+	hsa_status_t status;
+	void *ptr;
+
+	printf("Initializing HSA.....\n");
+
+	status = hsa_init();
+
+	if (status != HSA_STATUS_SUCCESS) {
+		printf("Failure to open HSA connection: 0x%x\n", status);
+		exit(1);
+	}
+
+	printf("Searching for HSA agent with index %lu\n",
+			user_param->hsa_agent_index);
+	hsa_iterate_index = 0;
+	hsa_agent.handle = (uint64_t) -1;
+	status = hsa_iterate_agents(hsa_agent_callback, user_param);
+
+	if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK) {
+		printf("Failure to iterate HSA agents: 0x%x\n", status);
+		exit(1);
+	}
+
+	if (hsa_agent.handle == (uint64_t)-1) {
+		printf("Could not find HSA agent with given index.\n");
+		exit(1);
+	}
+
+	printf("Searching for global pool with index %lu\n", user_param->hsa_pool_index);
+
+	hsa_iterate_index = 0;
+	hsa_pool.handle = (uint64_t) -1;
+	status = hsa_amd_agent_iterate_memory_pools(hsa_agent, memory_pool_callback, user_param);
+
+	if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK) {
+		printf("Failure to iterate regions: 0x%x\n", status);
+		exit(1);
+	}
+
+	if (hsa_pool.handle == (uint64_t)-1) {
+		printf("Could not find memory pool with given index\n");
+		exit(1);
+	}
+
+	status = hsa_amd_memory_pool_allocate(hsa_pool, _size, 0, &ptr);
+
+	if (status != HSA_STATUS_SUCCESS) {
+		printf("Failure to allocate HSA memory: 0x%x\n", status);
+		exit(1);
+	}
+
+	printf("Allocated HSA buffer at %p (Size 0x%lx)\n",
+			ptr, (unsigned long) _size);
+	ctx->buf[0] = ptr;
+
+	return 0;
+}
+static int pp_hsa_shutdown(struct pingpong_context *ctx)
+{
+	hsa_status_t status;
+	int ret = 0;
+
+	status = hsa_amd_memory_pool_free(ctx->buf[0]);
+	ctx->buf[0] = NULL;
+
+	if (status != HSA_STATUS_SUCCESS) {
+		printf("Failure to free HSA memory: 0x%x\n", status);
+		exit(1);
+	}
+
+	printf("Shutdown HSA.....\n");
+	status = hsa_shut_down();
+
+	if (status != HSA_STATUS_SUCCESS) {
+		fprintf(stderr, "Failure to close HSA connection: 0x%x\n",
+				status);
+		exit(1);
+	}
+
+	return ret;
+}
+#endif
+
 static int pp_init_mmap(struct pingpong_context *ctx, size_t size,
 			const char *fname, unsigned long offset)
 {
@@ -874,6 +1072,12 @@ int destroy_ctx(struct pingpong_context *ctx,
 	}
 	else
 	#endif
+	#ifdef HAVE_ROCM
+	if (user_param->use_rocm) {
+		pp_hsa_shutdown(ctx);
+	}
+	else
+	#endif
 	if (user_param->mmap_file != NULL) {
 		pp_free_mmap(ctx);
 	} else if (ctx->is_contig_supported == FAILURE) {
@@ -1163,7 +1367,15 @@ int create_single_mr(struct pingpong_context *ctx, struct perftest_parameters *u
 		}
 	} else
 	#endif
-
+	#ifdef HAVE_ROCM
+	if (user_param->use_rocm) {
+		ctx->is_contig_supported = FAILURE;
+		if(pp_hsa_init(ctx, ctx->buff_size, user_param)) {
+			fprintf(stderr, "Couldn't allocate work buf.\n");
+			return 1;
+		}
+	} else
+	#endif
 	if (user_param->mmap_file != NULL) {
 		#if defined(__FreeBSD__)
 		posix_memalign(ctx->buf, user_param->cycle_buffer, ctx->buff_size);
